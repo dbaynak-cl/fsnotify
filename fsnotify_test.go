@@ -14,10 +14,10 @@ import (
 
 func TestEventStringWithValue(t *testing.T) {
 	for opMask, expectedString := range map[Op]string{
-		Chmod | Create: `"/usr/someFile": CREATE|CHMOD`,
-		Rename:         `"/usr/someFile": RENAME`,
-		Remove:         `"/usr/someFile": REMOVE`,
-		Write | Chmod:  `"/usr/someFile": WRITE|CHMOD`,
+		Chmod | Create:         `"/usr/someFile": CREATE|CHMOD`,
+		Rename:                 `"/usr/someFile": RENAME`,
+		Remove:                 `"/usr/someFile": REMOVE`,
+		Write | Chmod:          `"/usr/someFile": WRITE|CHMOD`,
 		Chmod | Create | IsDir: `"/usr/someFile": CREATE|CHMOD|ISDIR`,
 	} {
 		event := Event{Name: "/usr/someFile", Op: opMask}

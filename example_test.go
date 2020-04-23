@@ -9,7 +9,7 @@ package fsnotify_test
 import (
 	"log"
 
-	"github.com/cloudlinux/fsnotify"
+	"github.com/dbaynak-cl/fsnotify"
 )
 
 func ExampleNewWatcher() {

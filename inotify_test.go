@@ -308,8 +308,8 @@ func TestInotifyInnerMapLength(t *testing.T) {
 
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if len(w.paths) != 0 {
-		t.Fatalf("Expected paths len is 0, but got: %d, %v", len(w.paths), w.paths)
+	if w.paths.Size() != 0 {
+		t.Fatalf("Expected paths len is 0, but got: %d, %v", w.paths.Size(), w.paths)
 	}
 }
 

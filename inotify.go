@@ -7,10 +7,12 @@
 package fsnotify
 
 import (
+	"bytes"
 	"errors"
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"unsafe"
@@ -22,6 +24,15 @@ const DefaultFlags = unix.IN_MOVED_TO | unix.IN_MOVED_FROM |
 	unix.IN_CREATE | unix.IN_ATTRIB | unix.IN_MODIFY |
 	unix.IN_MOVE_SELF | unix.IN_DELETE | unix.IN_DELETE_SELF
 
+type pathsItem struct {
+	// key
+	watchId uint32
+
+	// value
+	parentId int
+	relpath  string
+}
+
 // Watcher watches a set of files, delivering events to a channel.
 type Watcher struct {
 	Events   chan Event
@@ -29,10 +40,10 @@ type Watcher struct {
 	mu       sync.Mutex // Map access
 	fd       int
 	poller   *fdPoller
-	paths    map[int]string    // Map of watched paths (key: watch descriptor)
-	done     chan struct{}     // Channel for sending a "quit message" to the reader goroutine
-	doneResp chan struct{}     // Channel to respond to Close
-	flags uint32
+	paths    *Map          // Map of watched paths (key: watch descriptor)
+	done     chan struct{} // Channel for sending a "quit message" to the reader goroutine
+	doneResp chan struct{} // Channel to respond to Close
+	flags    uint32
 }
 
 // NewWatcher establishes a new watcher with the underlying OS and begins waiting for events.
@@ -51,16 +62,32 @@ func NewWatcher(flags uint32) (*Watcher, error) {
 	w := &Watcher{
 		fd:       fd,
 		poller:   poller,
-		paths:    make(map[int]string),
+		paths:    New(64, 0.8),
 		Events:   make(chan Event),
 		Errors:   make(chan error),
 		done:     make(chan struct{}),
 		doneResp: make(chan struct{}),
-		flags: flags | unix.IN_DELETE_SELF,
+		flags:    flags | unix.IN_DELETE_SELF,
 	}
 
 	go w.readEvents()
 	return w, nil
+}
+
+func (w *Watcher) Decode(watchId int) (string, error) {
+	if watchId == -1 {
+		return "/", nil
+	}
+
+	ww, ok := w.paths.Get(uint32(watchId))
+	if !ok {
+		return "", errors.New("unknown watchId")
+	}
+	r, err := w.Decode(ww.parentId)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(r, ww.relpath), nil
 }
 
 func (w *Watcher) isClosed() bool {
@@ -91,8 +118,8 @@ func (w *Watcher) Close() error {
 }
 
 // Add starts watching the named file or directory (non-recursively).
-func (w *Watcher) Add(name string) error {
-	name = filepath.Clean(name)
+func (w *Watcher) Add(path string) (err error) {
+	path = filepath.Clean(path)
 	if w.isClosed() {
 		return errors.New("inotify instance already closed")
 	}
@@ -101,18 +128,75 @@ func (w *Watcher) Add(name string) error {
 
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	wd, errno := unix.InotifyAddWatch(w.fd, name, flags)
+	//log.Printf("unix.InotifyAddWatch: %v", abspath)
+	wd, errno := unix.InotifyAddWatch(w.fd, path, flags)
 	if wd == -1 {
 		return errno
 	}
-	w.paths[wd] = name
+	w.paths.Put(pathsItem{watchId: uint32(wd), parentId: -1, relpath: path})
 
 	return nil
 }
 
-type watch struct {
-	wd    uint32 // Watch descriptor (as returned by the inotify_add_watch() syscall)
-	flags uint32 // inotify flags of this watch (see inotify(7) for the list of valid flags)
+// Add starts watching the named file or directory (non-recursively).
+func (w *Watcher) AddOptimized(parentId int, abspath, relpath string) (watchId int, err error) {
+	abspath = filepath.Clean(abspath)
+	if w.isClosed() {
+		return -1, errors.New("inotify instance already closed")
+	}
+
+	flags := w.flags | unix.IN_DELETE_SELF
+
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	//log.Printf("unix.InotifyAddWatch: %v", abspath)
+	wd, errno := unix.InotifyAddWatch(w.fd, abspath, flags)
+	if wd == -1 {
+		return -1, errno
+	}
+	w.paths.Put(pathsItem{watchId: uint32(wd), parentId: parentId, relpath: relpath})
+
+	return wd, nil
+}
+
+func InotifyAddWatch(fd int, ptr *byte, mask uint32) (watchdesc int, err error) {
+	if err != nil {
+		return
+	}
+	r0, _, e1 := unix.Syscall(unix.SYS_INOTIFY_ADD_WATCH, uintptr(fd), uintptr(unsafe.Pointer(ptr)), uintptr(mask))
+	watchdesc = int(r0)
+	if e1 != 0 {
+		err = e1
+	}
+	return
+}
+
+func (w *Watcher) AddAt(dirFd int, parentWatchId int, relpath string) (watchId int, err error) {
+	if w.isClosed() {
+		return -1, errors.New("inotify instance already closed")
+	}
+
+	flags := w.flags | unix.IN_DELETE_SELF
+
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	buff := make([]byte, 0, unix.PathMax) // does not leak
+	bb := bytes.NewBuffer(buff)
+	bb.WriteString("/proc/self/fd/")
+	bb.WriteString(strconv.Itoa(dirFd))
+	bb.WriteRune(os.PathSeparator)
+	bb.WriteString(relpath)
+	bb.WriteRune(0)
+
+	//log.Printf("unix.InotifyAddWatch: %v", abspath)
+	wd, errno := InotifyAddWatch(w.fd, &bb.Bytes()[0], flags)
+	if wd == -1 {
+		return -1, errno
+	}
+	w.paths.Put(pathsItem{watchId: uint32(wd), parentId: parentWatchId, relpath: relpath})
+
+	return wd, nil
 }
 
 // readEvents reads from the inotify file descriptor, converts the
@@ -207,13 +291,17 @@ func (w *Watcher) readEvents() {
 			// the "Name" field with a valid filename. We retrieve the path of the watch from
 			// the "paths" map.
 			w.mu.Lock()
-			name, ok := w.paths[int(raw.Wd)]
+			name, err := w.Decode(int(raw.Wd))
+			//if err != nil {
+			//	println(err.Error())
+			//}
+			ok := err == nil
 			// IN_DELETE_SELF occurs when the file/directory being watched is removed.
 			// This is a sign to clean up the maps, otherwise we are no longer in sync
 			// with the inotify kernel state which has already deleted the watch
 			// automatically.
 			if ok && mask&unix.IN_DELETE_SELF == unix.IN_DELETE_SELF {
-				delete(w.paths, int(raw.Wd))
+				w.paths.Del(uint32(raw.Wd))
 			}
 			w.mu.Unlock()
 
@@ -225,6 +313,7 @@ func (w *Watcher) readEvents() {
 			}
 
 			event := newEvent(name, mask)
+			event.WatchId = int(raw.Wd)
 
 			// Send the events that are not ignored on the events channel
 			if !event.ignoreLinux(mask) {

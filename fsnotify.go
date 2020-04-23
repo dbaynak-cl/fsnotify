@@ -19,6 +19,8 @@ type Event struct {
 	Name string // Relative path to the file or directory.
 	Op   Op     // File operation that triggered the event.
 	File *os.File
+
+	WatchId int
 }
 
 // Op describes a set of file operations.
